@@ -27,7 +27,7 @@ under `--pretty`. Credentials come from `--username` with `--password` or
 `--password-stdin`; without them every command asks the registry anonymously.
 Errors print as `Error: <message>` on stderr with exit status 1.
 
-## Manifest types from the image spec
+## The specifications in the code
 
 The manifest and descriptor types are generated at build time from the OCI
 image spec's JSON Schema, vendored under `schema/` at the commit `SOURCE`
@@ -35,6 +35,19 @@ names. The build script bundles the schema's cross-file references into one
 document and hands it to [typify](https://github.com/oxidecomputer/typify),
 so a digest, a media type or an annotation key that the spec's patterns
 reject is refused before anything reaches the registry.
+
+The spec's named values that no schema carries come from
+[oci-spec](https://github.com/containers/oci-spec-rs): the media types of a
+manifest, a layer and the empty config, and the annotation keys for a title
+and a creation time. A reference is parsed against the distribution spec's
+grammar from the same crate before the client sees it. The distribution
+protocol itself, with its token exchange, blob upload sessions and manifest
+requests, is oci-client's.
+
+The oras stack carries no other interface definition. oras is a cobra
+program whose contract is its help text, oras-go is a library, and the
+distribution spec is prose with a Go conformance suite, so an OpenAPI
+generator has nothing to consume there.
 
 ## Releases
 

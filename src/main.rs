@@ -8,11 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::HeaderValue;
 use oci_client::client::{Client, ClientConfig, ClientProtocol, Config, ImageLayer};
-use oci_client::manifest::{
-    IMAGE_LAYER_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
-};
+use oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
+use oci_spec::distribution::Reference as SpecReference;
+use oci_spec::image::{ANNOTATION_CREATED, ANNOTATION_TITLE, MediaType};
 use serde_json::{Value, json};
 
 #[allow(clippy::all, dead_code)]
@@ -59,12 +59,21 @@ const DIGEST_SEPARATOR: char = '@';
 const REPOSITORY_SEPARATOR: char = '/';
 
 const DEFAULT_ARTIFACT_TYPE: &str = "application/vnd.unknown.artifact.v1";
-const EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const EMPTY_CONFIG: &str = "{}";
 const EMPTY_CONFIG_DATA: &str = "e30=";
 const SCHEMA_VERSION: i64 = 2;
-const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
-const CREATED_ANNOTATION: &str = "org.opencontainers.image.created";
+
+fn manifest_media_type() -> String {
+    MediaType::ImageManifest.to_string()
+}
+
+fn empty_media_type() -> String {
+    MediaType::EmptyJSON.to_string()
+}
+
+fn layer_media_type() -> String {
+    MediaType::ImageLayer.to_string()
+}
 const SHORT_DIGEST_HEX: usize = 12;
 const DIGEST_PREFIX: &str = "sha256:";
 
@@ -195,8 +204,8 @@ fn file_and_media_type(word: &str) -> (PathBuf, String) {
         Some((file, media_type)) if media_type.contains(MEDIA_TYPE_MARK) => {
             (PathBuf::from(file), media_type.to_string())
         }
-        Some((file, "")) => (PathBuf::from(file), IMAGE_LAYER_MEDIA_TYPE.to_string()),
-        _ => (PathBuf::from(word), IMAGE_LAYER_MEDIA_TYPE.to_string()),
+        Some((file, "")) => (PathBuf::from(file), layer_media_type()),
+        _ => (PathBuf::from(word), layer_media_type()),
     }
 }
 
@@ -314,6 +323,7 @@ fn auth(options: &Options) -> Result<RegistryAuth, String> {
 }
 
 fn reference(name: &str) -> Result<Reference, String> {
+    SpecReference::try_from(name).map_err(|e| format!("invalid reference \"{name}\": {e}"))?;
     Reference::try_from(name).map_err(|e| format!("invalid reference \"{name}\": {e}"))
 }
 
@@ -449,14 +459,14 @@ fn manifest(
         annotations: Some(annotations(manifest_annotations)?),
         artifact_type: Some(media_type(artifact_type)?),
         config: descriptor(
-            EMPTY_CONFIG_MEDIA_TYPE,
+            &empty_media_type(),
             &sha256_digest(EMPTY_CONFIG.as_bytes()),
             EMPTY_CONFIG.len(),
             None,
             Some(EMPTY_CONFIG_DATA),
         )?,
         layers,
-        media_type: Some(media_type(OCI_IMAGE_MEDIA_TYPE)?),
+        media_type: Some(media_type(&manifest_media_type())?),
         schema_version: SCHEMA_VERSION,
         subject: None,
     })
@@ -472,7 +482,7 @@ fn descriptor_of(manifest_bytes: &[u8]) -> Result<ContentDescriptor, String> {
         digest: digest(&sha256_digest(manifest_bytes))?,
         media_type: match parsed.media_type {
             Some(found) => found,
-            None => media_type(OCI_IMAGE_MEDIA_TYPE)?,
+            None => media_type(&manifest_media_type())?,
         },
         size: size(manifest_bytes.len())?,
         urls: None,
@@ -513,24 +523,20 @@ async fn push(
             media_type,
             &digest,
             layer.data.len(),
-            Some(annotations([(TITLE_ANNOTATION.to_string(), title)])?),
+            Some(annotations([(ANNOTATION_TITLE.to_string(), title)])?),
             None,
         )?);
     }
-    let config = Config::new(
-        EMPTY_CONFIG.as_bytes().to_vec(),
-        EMPTY_CONFIG_MEDIA_TYPE.to_string(),
-        None,
-    );
+    let config = Config::new(EMPTY_CONFIG.as_bytes().to_vec(), empty_media_type(), None);
     let config_digest = config.sha256_digest();
     client
         .push_blob(&image, config.data.clone(), &config_digest)
         .await
         .map_err(|e| format!("failed to push the config: {e}"))?;
-    uploaded(&mut out, &config_digest, EMPTY_CONFIG_MEDIA_TYPE);
+    uploaded(&mut out, &config_digest, &empty_media_type());
     let mut manifest_annotations: BTreeMap<String, String> = user_annotations.into_iter().collect();
     manifest_annotations
-        .entry(CREATED_ANNOTATION.to_string())
+        .entry(ANNOTATION_CREATED.to_string())
         .or_insert(created_now()?);
     let manifest = manifest(artifact_type, layers, manifest_annotations.clone())?;
     let body =
@@ -540,11 +546,12 @@ async fn push(
         .push_manifest_raw(
             &image,
             body.clone(),
-            HeaderValue::from_static(OCI_IMAGE_MEDIA_TYPE),
+            HeaderValue::from_str(&manifest_media_type())
+                .map_err(|e| format!("the manifest media type is not a header value: {e}"))?,
         )
         .await
         .map_err(|e| format!("failed to push the manifest of {name}: {e}"))?;
-    uploaded(&mut out, &digest, OCI_IMAGE_MEDIA_TYPE);
+    uploaded(&mut out, &digest, &manifest_media_type());
     match format {
         Format::Text => {
             out.extend_from_slice(
@@ -558,7 +565,7 @@ async fn push(
         Format::Json => {
             let report = json!({
                 "reference": format!("{}{DIGEST_SEPARATOR}{digest}", repository(&image)),
-                "mediaType": OCI_IMAGE_MEDIA_TYPE,
+                "mediaType": manifest_media_type(),
                 "digest": digest,
                 "size": body.len(),
                 "annotations": manifest_annotations,
@@ -604,7 +611,7 @@ async fn manifest_fetch(
         .pull_manifest_raw(
             &image,
             auth,
-            &[OCI_IMAGE_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE],
+            &[manifest_media_type().as_str(), IMAGE_MANIFEST_MEDIA_TYPE],
         )
         .await
         .map_err(|e| format!("failed to fetch the content of \"{name}\": {e}"))?;
@@ -730,7 +737,7 @@ mod tests {
                     name: "ghcr.io/zingolabs/zingolib/binding-layer-android:abc".to_string(),
                     files: vec![
                         (PathBuf::from("bundle.aar"), "application/zip".to_string()),
-                        (PathBuf::from("plain"), IMAGE_LAYER_MEDIA_TYPE.to_string()),
+                        (PathBuf::from("plain"), layer_media_type()),
                     ],
                     annotations: vec![
                         ("a".to_string(), "1".to_string()),
@@ -747,7 +754,7 @@ mod tests {
     fn a_file_with_a_colon_and_an_empty_type_keeps_its_name() {
         assert_eq!(
             file_and_media_type("hi:txt:"),
-            (PathBuf::from("hi:txt"), IMAGE_LAYER_MEDIA_TYPE.to_string())
+            (PathBuf::from("hi:txt"), layer_media_type())
         );
     }
 
@@ -823,7 +830,7 @@ mod tests {
             16,
             Some(
                 annotations([(
-                    TITLE_ANNOTATION.to_string(),
+                    ANNOTATION_TITLE.to_string(),
                     "zingo-android.aar".to_string(),
                 )])
                 .unwrap(),
@@ -836,7 +843,7 @@ mod tests {
                 DEFAULT_ARTIFACT_TYPE,
                 vec![layer],
                 [(
-                    CREATED_ANNOTATION.to_string(),
+                    ANNOTATION_CREATED.to_string(),
                     "2026-10-09T20:51:30Z".to_string(),
                 )]
                 .into(),
@@ -845,9 +852,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest["schemaVersion"], 2);
-        assert_eq!(manifest["mediaType"], OCI_IMAGE_MEDIA_TYPE);
+        assert_eq!(manifest["mediaType"], manifest_media_type());
         assert_eq!(manifest["artifactType"], DEFAULT_ARTIFACT_TYPE);
-        assert_eq!(manifest["config"]["mediaType"], EMPTY_CONFIG_MEDIA_TYPE);
+        assert_eq!(manifest["config"]["mediaType"], empty_media_type());
         assert_eq!(
             manifest["config"]["digest"],
             "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
@@ -855,11 +862,11 @@ mod tests {
         assert_eq!(manifest["config"]["size"], 2);
         assert_eq!(manifest["config"]["data"], EMPTY_CONFIG_DATA);
         assert_eq!(
-            manifest["layers"][0]["annotations"][TITLE_ANNOTATION],
+            manifest["layers"][0]["annotations"][ANNOTATION_TITLE],
             "zingo-android.aar"
         );
         assert_eq!(
-            manifest["annotations"][CREATED_ANNOTATION],
+            manifest["annotations"][ANNOTATION_CREATED],
             "2026-10-09T20:51:30Z"
         );
     }
@@ -868,7 +875,7 @@ mod tests {
     fn the_descriptor_carries_the_digest_size_annotations_and_artifact_type() {
         let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.unknown.artifact.v1","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},"layers":[],"annotations":{"k":"v"}}"#;
         let descriptor = serde_json::to_value(descriptor_of(manifest).unwrap()).unwrap();
-        assert_eq!(descriptor["mediaType"], OCI_IMAGE_MEDIA_TYPE);
+        assert_eq!(descriptor["mediaType"], manifest_media_type());
         assert_eq!(descriptor["digest"], sha256_digest(manifest));
         assert_eq!(descriptor["size"], manifest.len());
         assert_eq!(descriptor["annotations"]["k"], "v");
