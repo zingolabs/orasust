@@ -924,7 +924,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orasust"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "http",
  "oci-client",

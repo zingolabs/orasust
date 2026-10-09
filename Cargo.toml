@@ -1,9 +1,13 @@
 [package]
 name = "orasust"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "The minimal oras subset the zingolib Binding Layer publication needs"
-publish = false
+description = "The subset of the oras command line that the zingolib Binding Layer publication needs: push, resolve, manifest fetch and version"
+license = "MIT"
+repository = "https://github.com/zingolabs/orasust"
+readme = "README.md"
+keywords = ["oci", "oras", "registry", "artifact"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 http = "1"

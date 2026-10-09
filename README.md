@@ -49,9 +49,15 @@ program whose contract is its help text, oras-go is a library, and the
 distribution spec is prose with a Go conformance suite, so an OpenAPI
 generator has nothing to consume there.
 
-## Releases
+## Installing
 
-A tag `v<version>` builds the Linux x86_64 binary and attaches it to a GitHub
-release as `orasust-x86_64-unknown-linux-gnu`. The tag must equal the crate
-version. A consumer pins the version it installs and checks it against
-`orasust version`.
+The crate is published on crates.io, so a consumer installs the version it
+pins and checks it against `orasust version`:
+
+```
+cargo install --locked orasust@0.1.2
+```
+
+A tag `v<version>` also builds the Linux x86_64 binary and attaches it to a
+GitHub release as `orasust-x86_64-unknown-linux-gnu`. The tag must equal the
+crate version.
