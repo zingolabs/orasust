@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::HeaderValue;
 use oci_client::client::{Client, ClientConfig, ClientProtocol, Config, ImageLayer};
+use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
@@ -86,6 +87,32 @@ const VERSION_LABEL: &str = "Version:";
 const OS_ARCH_LABEL: &str = "OS/Arch:";
 const LABEL_WIDTH: usize = 16;
 const ERROR_PREFIX: &str = "Error:";
+const REGISTRY_ERROR_PREFIX: &str = "Error response from registry:";
+const CREDENTIAL_NOT_FOUND: &str = "basic credential not found";
+const NOT_FOUND: &str = "not found";
+const UNAUTHORIZED: u16 = 401;
+const DISABLE_PATH_VALIDATION_FLAG: &str = "--disable-path-validation";
+const CONFIG_KEY: &str = "config";
+const SUBJECT_KEY: &str = "subject";
+const LAYERS_KEY: &str = "layers";
+const MANIFEST_ORDER: [&str; 7] = [
+    "schemaVersion",
+    "mediaType",
+    "artifactType",
+    CONFIG_KEY,
+    LAYERS_KEY,
+    SUBJECT_KEY,
+    "annotations",
+];
+const DESCRIPTOR_ORDER: [&str; 7] = [
+    "mediaType",
+    "digest",
+    "size",
+    "urls",
+    "annotations",
+    "data",
+    "artifactType",
+];
 
 const USAGE: &str = "Usage:
   orasust push [flags] <name>[:<tag>] <file>[:<type>] [...]
@@ -100,6 +127,7 @@ Flags:
   -l, --full-reference             print the full reference with digest (resolve)
       --descriptor                 output the descriptor (manifest fetch)
       --pretty                     prettify JSON printed to stdout (manifest fetch)
+      --disable-path-validation    skip path validation (push)
   -u, --username <name>            registry username
   -p, --password <password>        registry password or token
       --password-stdin             read the password from stdin
@@ -130,13 +158,19 @@ enum Format {
 }
 
 #[derive(Debug, PartialEq)]
+struct PushOptions {
+    artifact_type: String,
+    format: Format,
+    disable_path_validation: bool,
+}
+
+#[derive(Debug, PartialEq)]
 enum Command {
     Push {
         name: String,
         files: Vec<(PathBuf, String)>,
         annotations: Vec<(String, String)>,
-        artifact_type: String,
-        format: Format,
+        settings: PushOptions,
     },
     Resolve {
         name: String,
@@ -164,6 +198,7 @@ struct Flags {
     annotations: Vec<(String, String)>,
     artifact_type: Option<String>,
     format: Option<Format>,
+    disable_path_validation: bool,
     full_reference: bool,
     descriptor: bool,
     pretty: bool,
@@ -230,6 +265,7 @@ fn parse(args: &[String]) -> Result<Request, String> {
             }
             PASSWORD_STDIN_FLAG => flags.options.password_from_stdin = true,
             PLAIN_HTTP_FLAG => flags.options.plain_http = true,
+            DISABLE_PATH_VALIDATION_FLAG => flags.disable_path_validation = true,
             FULL_REFERENCE_FLAG | FULL_REFERENCE_SHORT => flags.full_reference = true,
             DESCRIPTOR_FLAG => flags.descriptor = true,
             PRETTY_FLAG => flags.pretty = true,
@@ -244,11 +280,15 @@ fn parse(args: &[String]) -> Result<Request, String> {
         annotations,
         artifact_type,
         format,
+        disable_path_validation,
         full_reference,
         descriptor,
         pretty,
     } = flags;
-    let push_flags = !annotations.is_empty() || artifact_type.is_some() || format.is_some();
+    let push_flags = !annotations.is_empty()
+        || artifact_type.is_some()
+        || format.is_some()
+        || disable_path_validation;
     let resolve_flags = full_reference;
     let fetch_flags = descriptor || pretty;
     let (command, misplaced) = match words.as_slice() {
@@ -257,8 +297,12 @@ fn parse(args: &[String]) -> Result<Request, String> {
                 name: name.to_string(),
                 files: files.iter().map(|file| file_and_media_type(file)).collect(),
                 annotations,
-                artifact_type: artifact_type.unwrap_or_else(|| DEFAULT_ARTIFACT_TYPE.to_string()),
-                format: format.unwrap_or(Format::Text),
+                settings: PushOptions {
+                    artifact_type: artifact_type
+                        .unwrap_or_else(|| DEFAULT_ARTIFACT_TYPE.to_string()),
+                    format: format.unwrap_or(Format::Text),
+                    disable_path_validation,
+                },
             },
             resolve_flags || fetch_flags,
         ),
@@ -319,6 +363,84 @@ fn auth(options: &Options) -> Result<RegistryAuth, String> {
             "{USERNAME_FLAG} needs {PASSWORD_FLAG} or {PASSWORD_STDIN_FLAG}"
         )),
         (None, Some(_)) => Err(format!("a password needs {USERNAME_FLAG}")),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Failure {
+    Local(String),
+    Registry(String),
+}
+
+impl From<String> for Failure {
+    fn from(diagnostic: String) -> Self {
+        Self::Local(diagnostic)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(diagnostic) => write!(f, "{ERROR_PREFIX} {diagnostic}"),
+            Self::Registry(diagnostic) => write!(f, "{REGISTRY_ERROR_PREFIX} {diagnostic}"),
+        }
+    }
+}
+
+fn reason_phrase(code: u16) -> &'static str {
+    http::StatusCode::from_u16(code)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or_default()
+}
+
+fn is_not_found(code: &OciErrorCode) -> bool {
+    matches!(
+        code,
+        OciErrorCode::BlobUnknown
+            | OciErrorCode::ManifestBlobUnknown
+            | OciErrorCode::ManifestUnknown
+            | OciErrorCode::NameUnknown
+            | OciErrorCode::NotFound
+    )
+}
+
+fn registry_failure(
+    action: &str,
+    name: &str,
+    anonymous: bool,
+    error: OciDistributionError,
+) -> Failure {
+    match error {
+        OciDistributionError::UnauthorizedError { .. }
+        | OciDistributionError::AuthenticationFailure(_)
+            if anonymous =>
+        {
+            Failure::Local(CREDENTIAL_NOT_FOUND.to_string())
+        }
+        OciDistributionError::ServerError { code, .. } if anonymous && code == UNAUTHORIZED => {
+            Failure::Local(CREDENTIAL_NOT_FOUND.to_string())
+        }
+        OciDistributionError::UnauthorizedError { url } => Failure::Registry(format!(
+            "\"{url}\": response status code {UNAUTHORIZED}: {}",
+            reason_phrase(UNAUTHORIZED)
+        )),
+        OciDistributionError::ServerError { url, code, .. } => Failure::Registry(format!(
+            "\"{url}\": response status code {code}: {}",
+            reason_phrase(code)
+        )),
+        OciDistributionError::RegistryError { envelope, .. }
+            if envelope.errors.iter().all(|e| is_not_found(&e.code)) =>
+        {
+            Failure::Registry(format!("failed to {action}: {name}: {NOT_FOUND}"))
+        }
+        OciDistributionError::ImageManifestNotFoundError(_) => {
+            Failure::Registry(format!("failed to {action}: {name}: {NOT_FOUND}"))
+        }
+        OciDistributionError::RegistryError { envelope, .. } => {
+            Failure::Registry(format!("failed to {action}: {name}: {envelope}"))
+        }
+        other => Failure::Local(format!("failed to {action}: {other}")),
     }
 }
 
@@ -476,8 +598,8 @@ fn descriptor_of(manifest_bytes: &[u8]) -> Result<ContentDescriptor, String> {
     let parsed: ImageManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|e| format!("the manifest does not match the image spec: {e}"))?;
     Ok(ContentDescriptor {
-        annotations: parsed.annotations,
-        artifact_type: parsed.artifact_type,
+        annotations: None,
+        artifact_type: None,
         data: None,
         digest: digest(&sha256_digest(manifest_bytes))?,
         media_type: match parsed.media_type {
@@ -487,6 +609,50 @@ fn descriptor_of(manifest_bytes: &[u8]) -> Result<ContentDescriptor, String> {
         size: size(manifest_bytes.len())?,
         urls: None,
     })
+}
+
+fn ordered(value: Value, keys: &[&str]) -> Value {
+    match value {
+        Value::Object(mut fields) => {
+            let named: Vec<(String, Value)> = keys
+                .iter()
+                .filter_map(|key| fields.remove(*key).map(|field| ((*key).to_string(), field)))
+                .collect();
+            Value::Object(named.into_iter().chain(fields).collect())
+        }
+        other => other,
+    }
+}
+
+fn descriptor_in_oras_order(value: Value) -> Value {
+    ordered(value, &DESCRIPTOR_ORDER)
+}
+
+fn manifest_in_oras_order(manifest: &ImageManifest) -> Result<Value, String> {
+    let value =
+        serde_json::to_value(manifest).map_err(|e| format!("cannot encode the manifest: {e}"))?;
+    let mut value = ordered(value, &MANIFEST_ORDER);
+    for key in [CONFIG_KEY, SUBJECT_KEY] {
+        if let Some(field) = value.get_mut(key) {
+            *field = descriptor_in_oras_order(field.take());
+        }
+    }
+    if let Some(Value::Array(layers)) = value.get_mut(LAYERS_KEY) {
+        for layer in layers.iter_mut() {
+            *layer = descriptor_in_oras_order(layer.take());
+        }
+    }
+    Ok(value)
+}
+
+fn validated_path(file: &Path, disable_path_validation: bool) -> Result<(), String> {
+    if file.is_absolute() && !disable_path_validation {
+        return Err(format!(
+            "absolute file path detected. If it's intentional, use {DISABLE_PATH_VALIDATION_FLAG} flag to skip this check: {}",
+            file.display()
+        ));
+    }
+    Ok(())
 }
 
 fn uploaded(out: &mut Vec<u8>, digest: &str, what: &str) {
@@ -499,14 +665,22 @@ async fn push(
     name: &str,
     files: &[(PathBuf, String)],
     user_annotations: Vec<(String, String)>,
-    artifact_type: &str,
-    format: Format,
-) -> Result<Vec<u8>, String> {
+    settings: &PushOptions,
+) -> Result<Vec<u8>, Failure> {
+    let PushOptions {
+        artifact_type,
+        format,
+        disable_path_validation,
+    } = settings;
+    let anonymous = matches!(auth, RegistryAuth::Anonymous);
     let image = reference(name)?;
+    for (file, _) in files {
+        validated_path(file, *disable_path_validation)?;
+    }
     client
         .auth(&image, auth, RegistryOperation::Push)
         .await
-        .map_err(|e| format!("failed to authenticate to {name}: {e}"))?;
+        .map_err(|e| registry_failure(&format!("authenticate to {name}"), name, anonymous, e))?;
     let mut out = Vec::new();
     let mut layers = Vec::new();
     for (file, media_type) in files {
@@ -517,7 +691,7 @@ async fn push(
         client
             .push_blob(&image, layer.data.clone(), &digest)
             .await
-            .map_err(|e| format!("failed to push {title}: {e}"))?;
+            .map_err(|e| registry_failure(&format!("push {title}"), name, anonymous, e))?;
         uploaded(&mut out, &digest, &title);
         layers.push(descriptor(
             media_type,
@@ -532,15 +706,15 @@ async fn push(
     client
         .push_blob(&image, config.data.clone(), &config_digest)
         .await
-        .map_err(|e| format!("failed to push the config: {e}"))?;
+        .map_err(|e| registry_failure("push the config", name, anonymous, e))?;
     uploaded(&mut out, &config_digest, &empty_media_type());
     let mut manifest_annotations: BTreeMap<String, String> = user_annotations.into_iter().collect();
     manifest_annotations
         .entry(ANNOTATION_CREATED.to_string())
         .or_insert(created_now()?);
     let manifest = manifest(artifact_type, layers, manifest_annotations.clone())?;
-    let body =
-        serde_json::to_vec(&manifest).map_err(|e| format!("cannot encode the manifest: {e}"))?;
+    let body = serde_json::to_vec(&manifest_in_oras_order(&manifest)?)
+        .map_err(|e| format!("cannot encode the manifest: {e}"))?;
     let digest = sha256_digest(&body);
     client
         .push_manifest_raw(
@@ -550,7 +724,7 @@ async fn push(
                 .map_err(|e| format!("the manifest media type is not a header value: {e}"))?,
         )
         .await
-        .map_err(|e| format!("failed to push the manifest of {name}: {e}"))?;
+        .map_err(|e| registry_failure("push the manifest", name, anonymous, e))?;
     uploaded(&mut out, &digest, &manifest_media_type());
     match format {
         Format::Text => {
@@ -585,12 +759,19 @@ async fn resolve(
     auth: &RegistryAuth,
     name: &str,
     full_reference: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, Failure> {
     let image = reference(name)?;
     let digest = client
         .fetch_manifest_digest(&image, auth)
         .await
-        .map_err(|e| format!("failed to resolve digest: {e}"))?;
+        .map_err(|e| {
+            registry_failure(
+                "resolve digest",
+                name,
+                matches!(auth, RegistryAuth::Anonymous),
+                e,
+            )
+        })?;
     let line = if full_reference {
         format!("{}{DIGEST_SEPARATOR}{digest}\n", repository(&image))
     } else {
@@ -605,7 +786,7 @@ async fn manifest_fetch(
     name: &str,
     descriptor: bool,
     pretty: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, Failure> {
     let image = reference(name)?;
     let (bytes, _) = client
         .pull_manifest_raw(
@@ -614,11 +795,20 @@ async fn manifest_fetch(
             &[manifest_media_type().as_str(), IMAGE_MANIFEST_MEDIA_TYPE],
         )
         .await
-        .map_err(|e| format!("failed to fetch the content of \"{name}\": {e}"))?;
+        .map_err(|e| {
+            registry_failure(
+                &format!("fetch the content of \"{name}\""),
+                name,
+                matches!(auth, RegistryAuth::Anonymous),
+                e,
+            )
+        })?;
     let manifest = bytes.to_vec();
     let value: Value = if descriptor {
-        serde_json::to_value(descriptor_of(&manifest)?)
-            .map_err(|e| format!("cannot encode the descriptor: {e}"))?
+        descriptor_in_oras_order(
+            serde_json::to_value(descriptor_of(&manifest)?)
+                .map_err(|e| format!("cannot encode the descriptor: {e}"))?,
+        )
     } else if pretty {
         serde_json::from_slice(&manifest).map_err(|e| format!("the manifest is not JSON: {e}"))?
     } else {
@@ -629,7 +819,7 @@ async fn manifest_fetch(
     } else {
         serde_json::to_vec(&value)
     };
-    encoded.map_err(|e| format!("cannot encode the output: {e}"))
+    Ok(encoded.map_err(|e| format!("cannot encode the output: {e}"))?)
 }
 
 fn version() -> Vec<u8> {
@@ -641,7 +831,7 @@ fn version() -> Vec<u8> {
     .into_bytes()
 }
 
-fn serve(request: Request) -> Result<Vec<u8>, String> {
+fn serve(request: Request) -> Result<Vec<u8>, Failure> {
     let Request { options, command } = request;
     if command == Command::Version {
         return Ok(version());
@@ -665,20 +855,8 @@ fn serve(request: Request) -> Result<Vec<u8>, String> {
                 name,
                 files,
                 annotations,
-                artifact_type,
-                format,
-            } => {
-                push(
-                    &client,
-                    &auth,
-                    &name,
-                    &files,
-                    annotations,
-                    &artifact_type,
-                    format,
-                )
-                .await
-            }
+                settings,
+            } => push(&client, &auth, &name, &files, annotations, &settings).await,
             Command::Resolve {
                 name,
                 full_reference,
@@ -695,15 +873,15 @@ fn serve(request: Request) -> Result<Vec<u8>, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse(&args).and_then(serve) {
+    match parse(&args).map_err(Failure::Local).and_then(serve) {
         Ok(bytes) => {
             if let Err(e) = std::io::stdout().write_all(&bytes) {
                 eprintln!("{ERROR_PREFIX} cannot write to stdout: {e}");
                 exit(1);
             }
         }
-        Err(diagnostic) => {
-            eprintln!("{ERROR_PREFIX} {diagnostic}");
+        Err(failure) => {
+            eprintln!("{failure}");
             exit(1);
         }
     }
@@ -743,10 +921,72 @@ mod tests {
                         ("a".to_string(), "1".to_string()),
                         ("b".to_string(), "x=y".to_string()),
                     ],
-                    artifact_type: DEFAULT_ARTIFACT_TYPE.to_string(),
-                    format: Format::Json,
+                    settings: PushOptions {
+                        artifact_type: DEFAULT_ARTIFACT_TYPE.to_string(),
+                        format: Format::Json,
+                        disable_path_validation: false,
+                    },
                 },
             }
+        );
+    }
+
+    #[test]
+    fn an_absolute_file_path_is_refused_unless_validation_is_disabled() {
+        assert!(validated_path(Path::new("/tmp/bundle.aar"), false).is_err());
+        assert!(validated_path(Path::new("/tmp/bundle.aar"), true).is_ok());
+        assert!(validated_path(Path::new("bundle.aar"), false).is_ok());
+        assert!(parse(&words("resolve --disable-path-validation ghcr.io/x/y:z")).is_err());
+    }
+
+    #[test]
+    fn the_manifest_keys_follow_the_order_oras_writes() {
+        let layer = descriptor(
+            "application/zip",
+            "sha256:d5bd64a5c43b6f8cc7f6c7897e954e58b89abfed62e851a47f842de714cca7d0",
+            16,
+            Some(annotations([(ANNOTATION_TITLE.to_string(), "x.aar".to_string())]).unwrap()),
+            None,
+        )
+        .unwrap();
+        let manifest = manifest(DEFAULT_ARTIFACT_TYPE, vec![layer], BTreeMap::new()).unwrap();
+        let text = serde_json::to_string(&manifest_in_oras_order(&manifest).unwrap()).unwrap();
+        assert!(
+            text.starts_with(r#"{"schemaVersion":2,"mediaType":"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2,"data":"e30="}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""layers":[{"mediaType":"application/zip","digest":"sha256:d5bd64a5c43b6f8cc7f6c7897e954e58b89abfed62e851a47f842de714cca7d0","size":16,"annotations":{"org.opencontainers.image.title":"x.aar"}}]"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn registry_failures_read_as_oras_reports_them() {
+        let not_found = OciDistributionError::ImageManifestNotFoundError("x".to_string());
+        assert_eq!(
+            registry_failure("resolve digest", "r.io/a:b", true, not_found).to_string(),
+            "Error response from registry: failed to resolve digest: r.io/a:b: not found"
+        );
+        let anonymous = OciDistributionError::UnauthorizedError {
+            url: "http://r.io/v2/a/manifests/b".to_string(),
+        };
+        assert_eq!(
+            registry_failure("resolve digest", "r.io/a:b", true, anonymous).to_string(),
+            "Error: basic credential not found"
+        );
+        let refused = OciDistributionError::ServerError {
+            url: "http://r.io/v2/a/blobs/uploads/".to_string(),
+            code: 401,
+            message: "{}".to_string(),
+        };
+        assert_eq!(
+            registry_failure("push x", "r.io/a:b", false, refused).to_string(),
+            "Error response from registry: \"http://r.io/v2/a/blobs/uploads/\": response status code 401: Unauthorized"
         );
     }
 
@@ -872,14 +1112,20 @@ mod tests {
     }
 
     #[test]
-    fn the_descriptor_carries_the_digest_size_annotations_and_artifact_type() {
+    fn the_descriptor_carries_the_media_type_the_digest_and_the_size_as_oras_does() {
         let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.unknown.artifact.v1","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},"layers":[],"annotations":{"k":"v"}}"#;
-        let descriptor = serde_json::to_value(descriptor_of(manifest).unwrap()).unwrap();
-        assert_eq!(descriptor["mediaType"], manifest_media_type());
-        assert_eq!(descriptor["digest"], sha256_digest(manifest));
-        assert_eq!(descriptor["size"], manifest.len());
-        assert_eq!(descriptor["annotations"]["k"], "v");
-        assert_eq!(descriptor["artifactType"], DEFAULT_ARTIFACT_TYPE);
+        let descriptor = descriptor_in_oras_order(
+            serde_json::to_value(descriptor_of(manifest).unwrap()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_string(&descriptor).unwrap(),
+            format!(
+                r#"{{"mediaType":"{}","digest":"{}","size":{}}}"#,
+                manifest_media_type(),
+                sha256_digest(manifest),
+                manifest.len()
+            )
+        );
     }
 
     #[test]

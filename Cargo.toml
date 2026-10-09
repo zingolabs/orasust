@@ -1,6 +1,6 @@
 [package]
 name = "orasust"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "The subset of the oras command line that the zingolib Binding Layer publication needs: push, resolve, manifest fetch and version"
 license = "MIT"
@@ -15,7 +15,7 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 oci-spec = { version = "0.10.0", default-features = false, features = ["distribution", "image"] }
 regress = "0.12"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt"] }
 
 [build-dependencies]

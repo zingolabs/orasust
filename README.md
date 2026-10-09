@@ -25,7 +25,13 @@ under `--full-reference`. `manifest fetch` prints the manifest as the registry
 serves it, its descriptor under `--descriptor`, and either one prettified
 under `--pretty`. Credentials come from `--username` with `--password` or
 `--password-stdin`; without them every command asks the registry anonymously.
-Errors print as `Error: <message>` on stderr with exit status 1.
+Errors print as `Error: <message>` or `Error response from registry:
+<message>` on stderr with exit status 1, in the words oras uses.
+
+Parity was measured against oras 1.3.4 on a local registry with and without
+basic authentication. Pushing the same file with the same annotations through
+both tools yields byte-identical manifests apart from the creation second,
+and the descriptor and the not-found error lines are identical.
 
 ## The specifications in the code
 
@@ -55,7 +61,7 @@ The crate is published on crates.io, so a consumer installs the version it
 pins and checks it against `orasust version`:
 
 ```
-cargo install --locked orasust@0.1.2
+cargo install --locked orasust@0.1.3
 ```
 
 A tag `v<version>` also builds the Linux x86_64 binary and attaches it to a
