@@ -1,0 +1,22 @@
+[package]
+name = "orasust"
+version = "0.1.0"
+edition = "2024"
+description = "The minimal oras subset the zingolib Binding Layer publication needs"
+publish = false
+
+[dependencies]
+http = "1"
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+regress = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+
+[build-dependencies]
+schemars = "0.8"
+serde_json = "1"
+typify = "0.8"
+
+[profile.release]
+strip = true

@@ -1,0 +1,45 @@
+# A tag `v<version>` builds the Linux binary and attaches it to a GitHub
+# release of the same name. The tag must equal the crate version, so a
+# consumer that pins the version it installs reads the same number from
+# `orasust --version`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  ASSET: orasust-x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    name: Build and attach the binary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Require the tag to equal the crate version
+        run: |
+          version="$(cargo pkgid | sed 's/.*#//; s/.*@//')"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match crate version ${version}"
+            exit 1
+          fi
+
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/orasust "${ASSET}"
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
+            --notes "orasust ${GITHUB_REF_NAME}: the Linux x86_64 binary." "${ASSET}"
